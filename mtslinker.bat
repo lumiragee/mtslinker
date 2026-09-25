@@ -35,17 +35,28 @@ if errorlevel 1 (
 set "OUT=%USERPROFILE%\Videos\mtslinker"
 if not exist "%OUT%" mkdir "%OUT%"
 
+rem --- режим: при первом запуске спрашиваем, потом берём из mode.txt ---
+set "MODE="
+if exist "%~dp0mode.txt" set /p MODE=<"%~dp0mode.txt"
+if not defined MODE call :choosemode
+
 :loop
 cls
+if "%MODE%"=="full" (set "MLABEL=как в плеере, без экрана показываются вебки") else (set "MLABEL=только экран, без экрана чёрный кадр")
 echo ================ mtslinker ================
 echo видео сохраняются в %OUT%
+echo режим: %MLABEL%
 echo.
 set "URL="
-set /p "URL=вставь ссылку и нажми enter: "
+set /p "URL=вставь ссылку и нажми enter (m - сменить режим): "
 if not defined URL goto loop
 
 rem убираем кавычки, всё после ? и слеш в конце
 set "URL=%URL:"=%"
+if /i "%URL%"=="m" (
+    call :choosemode
+    goto loop
+)
 for /f "tokens=1 delims=?#" %%a in ("%URL%") do set "URL=%%a"
 if "%URL:~-1%"=="/" set "URL=%URL:~0,-1%"
 
@@ -62,10 +73,10 @@ if defined SID if not exist "%~dp0session.txt" (echo %SID%)>"%~dp0session.txt"
 echo.
 pushd "%OUT%"
 if defined SID goto withsid
-%PY% "%~dp0mts_merge.py" "%URL%"
+%PY% "%~dp0mts_merge.py" "%URL%" --mode %MODE%
 goto done
 :withsid
-%PY% "%~dp0mts_merge.py" "%URL%" --session-id %SID%
+%PY% "%~dp0mts_merge.py" "%URL%" --mode %MODE% --session-id %SID%
 :done
 popd
 
@@ -74,3 +85,16 @@ echo.
 echo enter чтобы скачать ещё одну запись
 pause >nul
 goto loop
+
+:choosemode
+echo.
+echo выбери режим:
+echo   1 - только экран. когда лектор не показывает экран, будет чёрный кадр
+echo       лучше для конспектов и анализа кадров
+echo   2 - как в плеере. когда экрана нет, показываются включённые вебки
+echo       (выключенные отсеиваются, несколько штук встают сеткой)
+set "M="
+set /p "M=1 или 2: "
+if "%M%"=="2" (set "MODE=full") else (set "MODE=screen")
+(echo %MODE%)>"%~dp0mode.txt"
+exit /b
