@@ -1,9 +1,7 @@
 """
 mts_merge: скачивает запись mts link и правильно склеивает её через ffmpeg.
 звук = все микрофоны, каждый кусок на своём времени.
-картинка = трансляция экрана (потоки screensharing). когда экран не транслируется:
-  --mode screen  чёрный кадр (удобно для конспектов и анализа кадров)
-  --mode full    включённые вебки, как в плеере (до 4 штук сеткой, выключенные отсеиваются)
+картинка = трансляция экрана (потоки screensharing), когда экрана нет - чёрный кадр.
 куски уже скачанные в папку записи повторно не качаются.
 """
 import argparse
@@ -20,8 +18,6 @@ FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36'
 W, H, FPS = 1920, 1080, 5
 FALLBACK_MIN_WIDTH = 1000  # если в данных нет пометки screensharing
-MAX_CAMS = 4
-MIN_SEGMENT = 2.0  # короче этого вебку не показываем, чтобы не мигало
 
 
 def parse_url(url):
@@ -80,90 +76,87 @@ def probe(path):
     return width, has_audio, dur
 
 
-def active_parts(path, a, b):
-    """куски [a, b] (время внутри файла), где на видео не чёрный кадр"""
-    p = subprocess.run([FFMPEG, '-hide_banner', '-nostats', '-ss', f'{a:.3f}', '-t', f'{b - a:.3f}', '-i', path,
-                        '-an', '-vf', 'setpts=PTS-STARTPTS,fps=2,scale=160:-2,blackdetect=d=1:pix_th=0.10',
-                        '-f', 'null', '-'],
-                       capture_output=True, text=True, encoding='utf-8', errors='replace')
-    blacks = [(float(x), float(y)) for x, y in
-              re.findall(r'black_start:\s*([\d.]+)\s+black_end:\s*([\d.]+)', p.stderr)]
-    parts, t = [], 0.0
-    for bs, be in blacks:
-        if bs - t >= MIN_SEGMENT:
-            parts.append((a + t, a + bs))
-        t = max(t, be)
-    if (b - a) - t >= MIN_SEGMENT:
-        parts.append((a + t, b))
-    return parts
+class Piece:
+    """кусок файла, стоящий на своём месте в записи"""
+    def __init__(self, pid, fidx, path, start, offset, length, kind, width, has_audio):
+        self.pid, self.fidx, self.path = pid, fidx, path
+        self.start, self.offset, self.length = start, offset, length
+        self.kind, self.width, self.has_audio = kind, width, has_audio
+
+    @property
+    def end(self):
+        return self.start + self.length
 
 
-def subtract(span, cover):
-    """span минус объединение cover -> список промежутков"""
-    out, t = [], span[0]
-    for x, y in sorted(cover):
-        if y <= t or x >= span[1]:
+def stream_kind(stream):
+    if isinstance(stream, dict):
+        if 'screensharing' in stream:
+            return 'screen'
+        if 'conference' in stream:
+            return 'camera'
+    return None
+
+
+def collect_items(json_data):
+    """все упоминания файлов в записи: (время в записи, позиция в файле, url, тип).
+    потоки, начатые до начала записи или до конца вырезанного куска, лежат не в mediasession.add,
+    а в снимке состояния (snapshot) с upTime - сколько секунд поток уже шёл к этому моменту"""
+    items, cuts = {}, []
+    for ev in json_data.get('eventLogs', []):
+        if not isinstance(ev, dict):
             continue
-        if x > t:
-            out.append((t, min(x, span[1])))
-        t = max(t, y)
-    if t < span[1]:
-        out.append((t, span[1]))
-    return out
+        rel = float(ev.get('relativeTime') or 0)
+        if ev.get('module') == 'cut.end':
+            cuts.append(rel)
+        data = ev.get('data')
+        if isinstance(data, dict) and data.get('url'):
+            items.setdefault((data['url'], round(rel, 3)), (rel, 0.0, data['url'], stream_kind(data.get('stream'))))
+        snap = ev.get('snapshot')
+        if isinstance(snap, dict) and isinstance(snap.get('data'), dict):
+            for m in snap['data'].get('mediasession') or []:
+                if isinstance(m, dict) and m.get('url'):
+                    items[(m['url'], round(rel, 3))] = (rel, float(m.get('upTime') or 0), m['url'],
+                                                         stream_kind(m.get('stream')))
+    return sorted(items.values()), sorted(cuts)
 
 
-def camera_segments(cams, gaps):
-    """cams: [(idx, start, dur, path)], gaps: где нет экрана.
-    вернёт [(a, b, [(idx, start), ...])] - какие вебки показывать в каждом отрезке"""
-    active = {}  # idx -> [(abs_a, abs_b)]
-    for idx, start, dur, path in cams:
-        for ga, gb in gaps:
-            a, b = max(ga, start), min(gb, start + dur)
-            if b - a < MIN_SEGMENT:
-                continue
-            for x, y in active_parts(path, a - start, b - start):
-                active.setdefault(idx, []).append((x + start, y + start))
-    if not active:
-        return []
-    starts = {idx: st for idx, st, _, _ in cams}
-    total = {idx: sum(y - x for x, y in iv) for idx, iv in active.items()}
-    points = sorted({p for iv in active.values() for x, y in iv for p in (x, y)})
-    segs = []
-    for a, b in zip(points, points[1:]):
-        mid = (a + b) / 2
-        on = [idx for idx, iv in active.items() if any(x <= mid < y for x, y in iv)]
-        on = sorted(on, key=lambda i: -total[i])[:MAX_CAMS]
-        if not on:
-            continue
-        on = sorted(on)
-        if segs and segs[-1][1] == a and [i for i, _ in segs[-1][2]] == on:
-            segs[-1] = (segs[-1][0], b, segs[-1][2])
-        else:
-            segs.append((a, b, [(i, starts[i]) for i in on]))
-    return [s for s in segs if s[1] - s[0] >= MIN_SEGMENT]
+def make_pieces(items, cuts, duration, info):
+    """info: url -> (fidx, path, width, has_audio, dur). кусок длится до конца файла,
+    до следующего появления того же файла или до следующего вырезанного места - что раньше"""
+    by_url = {}
+    for rel, off, url, kind in items:
+        if url in info:
+            by_url.setdefault(url, []).append((rel, off, kind))
+    pieces = []
+    for url, lst in by_url.items():
+        fidx, path, width, has_audio, fdur = info[url]
+        lst.sort()
+        for i, (rel, off, kind) in enumerate(lst):
+            end = min(duration, rel + max(fdur - off, 0))
+            if i + 1 < len(lst):
+                end = min(end, lst[i + 1][0])
+            nxt = [c for c in cuts if c > rel + 1e-3]
+            if nxt:
+                end = min(end, nxt[0])
+            if end - rel > 0.05:
+                pieces.append(Piece(len(pieces), fidx, path, rel, off, end - rel, kind, width, has_audio))
+    return pieces
 
 
-def build_timeline(duration, screens, segs):
-    """делит запись на отрезки: (a, b, 'экран'|'вебки'|'чёрный', источник).
-    экран важнее вебок; если экранов несколько сразу - берём тот, что включили позже"""
+def build_timeline(duration, screens):
+    """делит запись на отрезки: (a, b, 'экран'|'чёрный', кусок).
+    если экранов несколько сразу - берём тот, что включили позже"""
     pts = {0.0, duration}
-    for _, st, d in screens:
-        pts.update((max(0.0, st), min(duration, st + d)))
-    for a, b, _ in segs:
-        pts.update((a, b))
+    for sc in screens:
+        pts.update((max(0.0, sc.start), min(duration, sc.end)))
     pts = sorted(p for p in pts if 0 <= p <= duration)
     out = []
     for a, b in zip(pts, pts[1:]):
         if b - a < 0.05:
             continue
         mid = (a + b) / 2
-        cover = [(st, idx) for idx, st, d in screens if st <= mid < st + d]
-        if cover:
-            st, idx = max(cover)
-            item = ('экран', (idx, st))
-        else:
-            on = next((c for x, y, c in segs if x <= mid < y), None)
-            item = ('вебки', tuple(on)) if on else ('чёрный', None)
+        cover = [sc for sc in screens if sc.start <= mid < sc.end]
+        item = ('экран', max(cover, key=lambda sc: sc.start)) if cover else ('чёрный', None)
         if out and out[-1][2:] == item and abs(out[-1][1] - a) < 1e-6:
             out[-1] = (out[-1][0], b) + item
         else:
@@ -171,117 +164,88 @@ def build_timeline(duration, screens, segs):
     return out
 
 
-def build(directory, json_data, output_path, mode='screen'):
+def build(directory, json_data, output_path):
     duration = float(json_data.get('duration') or 0)
     if not duration:
         sys.exit('в данных записи нет длительности')
 
-    chunks = []
-    for ev in json_data.get('eventLogs', []):
-        if isinstance(ev, dict) and isinstance(ev.get('data'), dict) and 'url' in ev['data']:
-            stream = ev['data'].get('stream')
-            kind = None
-            if isinstance(stream, dict):
-                kind = 'screen' if 'screensharing' in stream else 'camera' if 'conference' in stream else None
-            chunks.append((float(ev.get('relativeTime') or 0), ev['data']['url'], kind))
-    marked = any(k is not None for _, _, k in chunks)
-    if not chunks:
+    items, cuts = collect_items(json_data)
+    urls = list(dict.fromkeys(url for _, _, url, _ in items))
+    if not urls:
         sys.exit('в записи не нашлось ни одного видео/аудио куска')
+    kinds = {url: kind for _, _, url, kind in items if kind}
+    marked = bool(kinds)
 
-    print(f'кусков: {len(chunks)}, длительность записи: {duration / 60:.0f} мин')
-    screens, audios, files, cams = [], [], [], []
-    has_video = set()
-    for i, (start, url, kind) in enumerate(chunks, 1):
-        print(f'[{i}/{len(chunks)}] ', end='')
+    print(f'файлов: {len(urls)}, длительность записи: {duration / 60:.0f} мин')
+    info = {}
+    for i, url in enumerate(urls, 1):
+        print(f'[{i}/{len(urls)}] ', end='')
         try:
             path = download(url, directory)
         except Exception as e:
             print(f'  не скачался, пропускаю: {e}')
             continue
-        info = probe(path)
-        if info is None:
+        pr = probe(path)
+        if pr is None:
             continue
-        width, has_audio, dur = info
-        idx = len(files)
-        files.append(path)
-        if width:
-            has_video.add(idx)
-        is_screen = (kind == 'screen') if marked else (width >= FALLBACK_MIN_WIDTH)
-        if is_screen and width:
-            screens.append((idx, start, dur))
-        elif width:
-            cams.append((idx, start, dur, path))
-        if has_audio:
-            audios.append((idx, start))
+        width, has_audio, fdur = pr
+        info[url] = (len(info), path, width, has_audio, fdur)
 
-    print(f'трансляций экрана: {len(screens)}, звуковых дорожек: {len(audios)}')
+    pieces = make_pieces(items, cuts, duration, info)
+    screens, audios = [], []
+    for pc in pieces:
+        is_screen = (pc.kind == 'screen') if marked else (pc.width >= FALLBACK_MIN_WIDTH)
+        if pc.width and is_screen:
+            screens.append(pc)
+        if pc.has_audio:
+            audios.append(pc)
+
+    print(f'\nтрансляций экрана: {len(screens)}, звуковых дорожек: {len(audios)}')
     if not audios:
         sys.exit('звука не нашлось')
 
-    segs = []
-    if mode == 'full' and cams:
-        gaps = subtract((0.0, duration), [(st, st + d) for _, st, d in screens])
-        print('ищу включённые вебки там, где нет экрана...')
-        segs = camera_segments(cams, gaps)
-        shown = sum(b - a for a, b, _ in segs)
-        print(f'вебки покажу в {len(segs)} местах, всего {shown / 60:.1f} мин')
-
-    timeline = build_timeline(duration, screens, segs)
+    timeline = build_timeline(duration, screens)
     print('картинка: ' + ', '.join(f'{k} {sum(b - a for a, b, kk, _ in timeline if kk == k) / 60:.0f} мин'
-                                   for k in ('экран', 'вебки', 'чёрный')))
+                                   for k in ('экран', 'чёрный')))
 
-    # звук: каждый файл целиком со своей задержкой
     args = [FFMPEG, '-hide_banner', '-loglevel', 'error', '-stats', '-y']
     fl = []
-    alabels = []
-    for n, (idx, start) in enumerate(audios):
-        args += ['-i', files[idx]]
-        trim = f'atrim=start={-start},asetpts=PTS-STARTPTS,' if start < 0 else ''
-        ms = int(max(start, 0) * 1000)
-        fl.append(f'[{n}:a]{trim}aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,'
-                  f'adelay={ms}|{ms}[a{n}]')
-        alabels.append(f'[a{n}]')
-    n_in = len(audios)
+    n_in = 0
 
-    # картинка: отрезки по очереди, каждый со своего места в файле (ничего не копится в памяти)
-    def seg_input(path, offset, length):
+    def add_input(path, offset, length, video=False):
+        # каждый кусок читается со своего места в файле - ничего не копится в памяти.
+        # у видео размер кадра может меняться посреди записи - не пересобираем фильтры
         nonlocal n_in
-        # размер кадра может меняться посреди записи - не пересобираем фильтры, а приводим к одному размеру
-        args.extend(['-reinit_filter', '0', '-ss', f'{max(offset, 0):.3f}', '-t', f'{length + 1:.3f}', '-i', path])
+        opts = ['-reinit_filter', '0'] if video else []
+        if offset > 0.001:
+            opts += ['-ss', f'{offset:.3f}']
+        args.extend(opts + ['-t', f'{length + (1 if video else 0):.3f}', '-i', path])
         n_in += 1
         return n_in - 1
+
+    # звук: каждый кусок со своей задержкой
+    alabels = []
+    for n, pc in enumerate(audios):
+        i = add_input(pc.path, pc.offset, pc.length)
+        ms = int(pc.start * 1000)
+        fl.append(f'[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,'
+                  f'adelay={ms}|{ms}[a{n}]')
+        alabels.append(f'[a{n}]')
 
     def fit(label_in, w, h, length, label_out):
         fl.append(f'{label_in}setpts=PTS-STARTPTS,fps={FPS},scale={w}:{h}:force_original_aspect_ratio=decrease,'
                   f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,'
                   f'tpad=stop=-1:stop_mode=add:color=black,trim=duration={length:.3f},setpts=PTS-STARTPTS{label_out}')
 
+    # картинка: отрезки по очереди
     vlabels = []
-    tw, th = W // 2, H // 2
-    for k, (a, b, kind, src) in enumerate(timeline):
+    for k, (a, b, kind, pc) in enumerate(timeline):
         length = b - a
         if kind == 'чёрный':
             fl.append(f'color=c=black:s={W}x{H}:r={FPS}:d={length:.3f},setsar=1,format=yuv420p[v{k}]')
-        elif kind == 'экран':
-            idx, start = src
-            i = seg_input(files[idx], a - start, length)
-            fit(f'[{i}:v]', W, H, length, f'[v{k}]')
         else:
-            if len(src) == 1:
-                idx, start = src[0]
-                i = seg_input(files[idx], a - start, length)
-                fit(f'[{i}:v]', W, H, length, f'[v{k}]')
-            else:
-                tiles = []
-                for j, (idx, start) in enumerate(src):
-                    i = seg_input(files[idx], a - start, length)
-                    fit(f'[{i}:v]', tw, th, length, f'[t{k}_{j}]')
-                    tiles.append(f'[t{k}_{j}]')
-                if len(src) == 2:
-                    fl.append(f'{"".join(tiles)}hstack=inputs=2,pad={W}:{H}:0:{th // 2}[v{k}]')
-                else:
-                    layout = '|'.join(['0_0', f'{tw}_0', f'0_{th}', f'{tw}_{th}'][:len(src)])
-                    fl.append(f'{"".join(tiles)}xstack=inputs={len(src)}:layout={layout}:fill=black[v{k}]')
+            i = add_input(pc.path, pc.offset + a - pc.start, length, video=True)
+            fit(f'[{i}:v]', W, H, length, f'[v{k}]')
         vlabels.append(f'[v{k}]')
     if len(vlabels) == 1:
         fl.append(f'{vlabels[0]}fps={FPS}[vout]')
@@ -312,8 +276,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('url')
     ap.add_argument('--session-id')
-    ap.add_argument('--mode', choices=['screen', 'full'], default='screen',
-                    help='screen: без экрана чёрный кадр; full: без экрана включённые вебки')
+    ap.add_argument('--mode', help=argparse.SUPPRESS)  # из старых версий батника, больше не используется
     a = ap.parse_args()
     ev, rec = parse_url(a.url)
     data = fetch_json(ev, rec, a.session_id)
@@ -322,7 +285,7 @@ def main():
     os.makedirs(directory, exist_ok=True)
     with open(os.path.join(directory, 'record.json'), 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False)
-    build(directory, data, os.path.abspath(name + '.mp4'), a.mode)
+    build(directory, data, os.path.abspath(name + '.mp4'))
 
 
 if __name__ == '__main__':
