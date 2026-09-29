@@ -21,23 +21,41 @@ FALLBACK_MIN_WIDTH = 1000  # если в данных нет пометки scre
 
 
 def parse_url(url):
-    m = re.match(r'^https://my\.mts-link\.ru/(?:[^/]+/)?\d+/\d+/record-new/(\d+)(?:/record-file/(\d+))?', url)
+    """ссылка на запись -> (адрес сайта, id сессии, id записи или None).
+    бывают my.mts-link.ru, hse.mts-link.ru и другие поддомены"""
+    m = re.match(r'^https://((?:[\w-]+\.)*mts-link\.ru)/(?:[^/]+/)?\d+/\d+/record-new/(\d+)(?:/record-file/(\d+))?', url)
     if not m:
         sys.exit('ссылка не похожа на запись mts link')
-    return m.group(1), m.group(2)
+    return m.group(1), m.group(2), m.group(3)
 
 
-def fetch_json(event_session, record_id, session_id):
+def fetch_json(host, event_session, record_id, session_id):
     if record_id:
-        api = f'https://my.mts-link.ru/api/event-sessions/{event_session}/record-files/{record_id}/flow?withoutCuts=false'
+        path = f'/api/event-sessions/{event_session}/record-files/{record_id}/flow?withoutCuts=false'
     else:
-        api = f'https://my.mts-link.ru/api/eventsessions/{event_session}/record?withoutCuts=false'
+        path = f'/api/eventsessions/{event_session}/record?withoutCuts=false'
     cookies = {'sessionId': session_id} if session_id else {}
-    r = httpx.get(api, headers={'User-Agent': UA}, cookies=cookies, timeout=60)
-    if r.status_code in (401, 403):
+    hosts = [host] + (['my.mts-link.ru'] if host != 'my.mts-link.ru' else [])
+    last = None
+    for h in hosts:
+        try:
+            r = httpx.get(f'https://{h}{path}', headers={'User-Agent': UA}, cookies=cookies, timeout=60)
+        except httpx.HTTPError as e:
+            last = e
+            continue
+        if r.status_code in (401, 403):
+            last = 'forbidden'
+            continue
+        if r.status_code == 200:
+            try:
+                return r.json()
+            except ValueError:
+                last = 'not json'
+                continue
+        last = r.status_code
+    if last == 'forbidden':
         sys.exit('доступ запрещён: запись закрытая или sessionId протух. удали session.txt и введи новый')
-    r.raise_for_status()
-    return r.json()
+    sys.exit(f'не получилось получить данные записи ({last})')
 
 
 def download(url, directory):
@@ -278,8 +296,8 @@ def main():
     ap.add_argument('--session-id')
     ap.add_argument('--mode', help=argparse.SUPPRESS)  # из старых версий батника, больше не используется
     a = ap.parse_args()
-    ev, rec = parse_url(a.url)
-    data = fetch_json(ev, rec, a.session_id)
+    host, ev, rec = parse_url(a.url)
+    data = fetch_json(host, ev, rec, a.session_id)
     name = re.sub(r'[\s/\\:*?"<>|]+', '_', data.get('name') or f'record_{ev}').strip('_.')
     directory = os.path.abspath(name)
     os.makedirs(directory, exist_ok=True)
